@@ -144,6 +144,46 @@ def inject_css() -> None:
             margin-top: .45rem;
         }}
 
+        .analysis-grid {{
+            display: grid;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: .75rem;
+            margin: .55rem 0 .85rem;
+        }}
+
+        .analysis-card {{
+            background: #ffffff;
+            border: 1px solid #e5eaf3;
+            border-radius: 8px;
+            padding: .85rem .9rem;
+            box-shadow: 0 6px 20px rgba(15, 23, 42, .045);
+        }}
+
+        .analysis-card.peak {{
+            border-left: 4px solid var(--secondary);
+        }}
+
+        .analysis-label {{
+            color: var(--muted);
+            font-size: .78rem;
+            line-height: 1.2;
+            margin-bottom: .35rem;
+        }}
+
+        .analysis-value {{
+            color: var(--text);
+            font-size: 1.2rem;
+            font-weight: 760;
+            line-height: 1.1;
+            overflow-wrap: anywhere;
+        }}
+
+        .analysis-help {{
+            color: var(--muted);
+            font-size: .74rem;
+            margin-top: .35rem;
+        }}
+
         .section-title {{
             color: var(--text);
             font-size: 1.12rem;
@@ -169,6 +209,9 @@ def inject_css() -> None:
             .kpi-grid {{
                 grid-template-columns: repeat(2, minmax(0, 1fr));
             }}
+            .analysis-grid {{
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+            }}
         }}
 
         @media (max-width: 640px) {{
@@ -180,6 +223,9 @@ def inject_css() -> None:
                 padding: 1rem;
             }}
             .kpi-grid {{
+                grid-template-columns: 1fr;
+            }}
+            .analysis-grid {{
                 grid-template-columns: 1fr;
             }}
         }}
@@ -340,6 +386,136 @@ def render_kpis(df: pd.DataFrame, series: pd.Series, best_model: str) -> None:
     st.markdown(f"<div class='kpi-grid'>{''.join(cards)}</div>", unsafe_allow_html=True)
 
 
+def analysis_card(label: str, value: str, help_text: str, highlight: bool = False) -> str:
+    peak_class = " peak" if highlight else ""
+    return (
+        f'<div class="analysis-card{peak_class}">'
+        f'<div class="analysis-label">{label}</div>'
+        f'<div class="analysis-value">{value}</div>'
+        f'<div class="analysis-help">{help_text}</div>'
+        "</div>"
+    )
+
+
+def four_week_analysis(future: pd.Series) -> tuple[pd.DataFrame, str]:
+    horizon = future.head(4).copy()
+    horizon.name = "Forecast Cylinder"
+    peak_date = horizon.idxmax()
+    peak_value = float(horizon.max())
+    total = float(horizon.sum())
+    average = float(horizon.mean())
+    delta = float(horizon.iloc[-1] - horizon.iloc[0])
+    direction = "naik" if delta > 0 else "turun" if delta < 0 else "stabil"
+
+    cards = [
+        analysis_card("Total forecast 4 minggu", format_number(total), "akumulasi kebutuhan forecast"),
+        analysis_card("Rata-rata per minggu", format_number(average, 1), "rata-rata dari 4 minggu forecast"),
+        analysis_card(
+            "Peak demand 4 minggu",
+            format_number(peak_value),
+            peak_date.strftime("%d %b %Y"),
+            highlight=True,
+        ),
+    ]
+
+    table = horizon.reset_index()
+    table.columns = ["Periode", "Forecast Cylinder"]
+    table.insert(0, "Minggu", [f"Minggu {idx}" for idx in range(1, len(table) + 1)])
+    table["Status"] = np.where(table["Periode"] == peak_date, "Peak demand", "Normal")
+
+    insight = (
+        f"Peak demand dari 4 minggu forecast ada pada {peak_date.strftime('%d %b %Y')} "
+        f"dengan estimasi {format_number(peak_value)} cylinder. Tren 4 minggu terlihat {direction} "
+        f"sebesar {format_number(abs(delta), 1)} cylinder dari minggu pertama ke minggu keempat."
+    )
+    return table, f"<div class='analysis-grid'>{''.join(cards)}</div><p>{insight}</p>"
+
+
+def four_week_peak_chart(future: pd.Series) -> go.Figure:
+    horizon = future.head(4).copy()
+    x_positions = list(range(1, len(horizon) + 1))
+    labels = [f"W{idx}<br>{date.strftime('%d %b')}" for idx, date in enumerate(horizon.index, start=1)]
+    peak_position = int(np.argmax(horizon.values)) + 1
+    peak_value = float(horizon.max())
+
+    y_min = max(0, float(horizon.min()) * 0.88)
+    y_max = float(horizon.max()) * 1.18
+    if y_max == y_min:
+        y_max = y_min + 1
+
+    fig = go.Figure()
+    fig.add_vrect(
+        x0=peak_position - 0.5,
+        x1=peak_position + 0.5,
+        fillcolor="#fff1a8",
+        opacity=0.72,
+        line_width=0,
+        layer="below",
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=x_positions,
+            y=horizon.values,
+            mode="lines+markers",
+            name="ARIMA Forecast",
+            line=dict(color="#c92535", width=4, shape="spline"),
+            marker=dict(size=9, color="#c92535", line=dict(color="#ffffff", width=2)),
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=[peak_position],
+            y=[peak_value],
+            mode="markers",
+            name="Peak Demand",
+            marker=dict(size=15, color="#fbbc04", line=dict(color="#c92535", width=3)),
+            showlegend=False,
+            hovertemplate="Peak Demand<br>%{y:,.0f} cylinder<extra></extra>",
+        )
+    )
+    fig.add_annotation(
+        x=peak_position,
+        y=y_max * 0.965,
+        text="<b>Peak<br>Demand</b>",
+        showarrow=False,
+        font=dict(size=18, color="#4b3b06"),
+        align="center",
+        bgcolor="rgba(255, 241, 168, 0.72)",
+        borderpad=6,
+    )
+    fig.update_layout(
+        title=dict(
+            text="<b>Request Order Cylinder<br>Forecast</b><br><sup>Weekly Demand Projection</sup>",
+            x=0,
+            xanchor="left",
+            font=dict(size=21, color=TEXT),
+        ),
+        height=420,
+        margin=dict(l=16, r=16, t=82, b=58),
+        plot_bgcolor="#ffffff",
+        paper_bgcolor="#ffffff",
+        font=dict(color=TEXT, family="Inter, Roboto, Arial, sans-serif"),
+        legend=dict(orientation="h", yanchor="top", y=-0.18, xanchor="center", x=0.5),
+        hovermode="x unified",
+    )
+    fig.update_xaxes(
+        tickmode="array",
+        tickvals=x_positions,
+        ticktext=labels,
+        range=[0.65, len(horizon) + 0.35],
+        showgrid=False,
+        linecolor="#d8dee9",
+        title=None,
+    )
+    fig.update_yaxes(
+        title="Jumlah Cylinder",
+        range=[y_min, y_max],
+        gridcolor="#e8edf5",
+        zerolinecolor="#e8edf5",
+    )
+    return fig
+
+
 def base_chart_layout(fig: go.Figure, height: int = 420) -> go.Figure:
     fig.update_layout(
         height=height,
@@ -490,7 +666,7 @@ def main() -> None:
         )
         frequency = "W" if frequency_label == "Mingguan" else "MS"
 
-        forecast_steps = st.slider("Jumlah periode forecast", 1, 12, 4)
+        forecast_steps = st.slider("Jumlah periode forecast", 4, 12, 4)
         ma_window = st.slider("Window Moving Average", 2, 8, 3)
 
     filtered_df, series = aggregate_series(df, selected_dates[0], selected_dates[1], frequency)
@@ -532,6 +708,16 @@ def main() -> None:
             width="stretch",
             hide_index=True,
         )
+
+    st.markdown("<div class='section-title'>Analisa 4 Minggu ke Depan</div>", unsafe_allow_html=True)
+    four_week_table, four_week_summary = four_week_analysis(future)
+    st.markdown(four_week_summary, unsafe_allow_html=True)
+    st.plotly_chart(four_week_peak_chart(future), width="stretch")
+    st.dataframe(
+        four_week_table.style.format({"Forecast Cylinder": "{:,.0f}"}),
+        width="stretch",
+        hide_index=True,
+    )
 
     st.markdown("<div class='section-title'>Perbandingan Aktual vs Prediksi</div>", unsafe_allow_html=True)
     st.plotly_chart(comparison_chart(test, results), width="stretch")
