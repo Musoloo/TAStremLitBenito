@@ -10,7 +10,6 @@ os.environ.setdefault("MPLCONFIGDIR", str(Path(tempfile.gettempdir()) / "streaml
 
 import numpy as np
 import pandas as pd
-import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 from sklearn.metrics import mean_absolute_error, mean_squared_error
@@ -583,18 +582,6 @@ def comparison_chart(test: pd.Series, results: list[ModelResult]) -> go.Figure:
     return base_chart_layout(fig, 420)
 
 
-def distribution_chart(series: pd.Series) -> go.Figure:
-    fig = px.histogram(
-        series.reset_index(name="Permintaan"),
-        x="Permintaan",
-        nbins=12,
-        color_discrete_sequence=[PRIMARY],
-    )
-    fig.update_traces(marker_line_width=0)
-    fig.update_layout(title="Distribusi Permintaan per Periode", bargap=0.08)
-    return base_chart_layout(fig, 360)
-
-
 def metrics_table(results: list[ModelResult]) -> pd.DataFrame:
     table = pd.DataFrame(
         {
@@ -605,22 +592,6 @@ def metrics_table(results: list[ModelResult]) -> pd.DataFrame:
         }
     )
     return table.sort_values("RMSE", ascending=True).reset_index(drop=True)
-
-
-def descriptive_table(series: pd.Series) -> pd.DataFrame:
-    desc = series.describe().rename(
-        {
-            "count": "Jumlah Data",
-            "mean": "Rata-rata",
-            "std": "Standar Deviasi",
-            "min": "Minimum",
-            "25%": "Kuartil 1",
-            "50%": "Median",
-            "75%": "Kuartil 3",
-            "max": "Maksimum",
-        }
-    )
-    return desc.to_frame("Nilai")
 
 
 def main() -> None:
@@ -722,17 +693,6 @@ def main() -> None:
     st.markdown("<div class='section-title'>Perbandingan Aktual vs Prediksi</div>", unsafe_allow_html=True)
     st.plotly_chart(comparison_chart(test, results), width="stretch")
 
-    col_a, col_b = st.columns([1, 1], gap="large")
-    with col_a:
-        st.markdown("<div class='section-title'>Distribusi Data</div>", unsafe_allow_html=True)
-        st.plotly_chart(distribution_chart(series), width="stretch")
-    with col_b:
-        st.markdown("<div class='section-title'>Statistik Deskriptif</div>", unsafe_allow_html=True)
-        st.dataframe(
-            descriptive_table(series).style.format({"Nilai": "{:,.2f}"}),
-            width="stretch",
-        )
-
     with st.expander("Lihat data olahan"):
         tab_daily, tab_periodic, tab_raw = st.tabs(["Harian", "Agregasi", "Transaksi"])
         daily_table = (
@@ -750,4 +710,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
