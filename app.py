@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 import tempfile
-from dataclasses import dataclass
 from pathlib import Path
 
 os.environ.setdefault("XDG_CACHE_HOME", str(Path(tempfile.gettempdir()) / "streamlit_cache"))
@@ -12,13 +11,20 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-from sklearn.metrics import mean_absolute_error, mean_squared_error
 from statsmodels.tsa.arima.model import ARIMA
 
 
-DATA_FILE = Path(__file__).with_name("edited data TA benito.xlsx")
+# =========================
+# KONFIGURASI UTAMA
+# =========================
+
+DATA_FILE = Path(__file__).with_name("edited data TA.xlsx")
+
 DATE_COLUMN = "Tanggal Job"
 VALUE_COLUMN = "Jumlah Cylinder"
+
+ARIMA_ORDER = (3, 0, 3)
+MODEL_NAME = "ARIMA(3,0,3)"
 
 PRIMARY = "#1a73e8"
 SECONDARY = "#00a86b"
@@ -30,15 +36,6 @@ SURFACE = "#ffffff"
 BG = "#f6f8fc"
 
 
-@dataclass(frozen=True)
-class ModelResult:
-    name: str
-    predictions: pd.Series
-    mae: float
-    rmse: float
-    mape: float
-
-
 st.set_page_config(
     page_title="Dashboard Forecast Permintaan Cylinder",
     page_icon=":bar_chart:",
@@ -46,6 +43,10 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+
+# =========================
+# CSS DASHBOARD
+# =========================
 
 def inject_css() -> None:
     st.markdown(
@@ -190,14 +191,6 @@ def inject_css() -> None:
             margin: .4rem 0 .25rem;
         }}
 
-        div[data-testid="stMetric"] {{
-            background: #ffffff;
-            border: 1px solid #e5eaf3;
-            border-radius: 8px;
-            padding: .85rem 1rem;
-            box-shadow: 0 6px 20px rgba(15, 23, 42, .045);
-        }}
-
         .stDataFrame, [data-testid="stTable"] {{
             border: 1px solid #e5eaf3;
             border-radius: 8px;
@@ -234,9 +227,14 @@ def inject_css() -> None:
     )
 
 
+# =========================
+# LOAD DAN OLAH DATA
+# =========================
+
 @st.cache_data(show_spinner=False)
 def load_workbook(source) -> pd.DataFrame:
     df = pd.read_excel(source)
+
     missing = {DATE_COLUMN, VALUE_COLUMN}.difference(df.columns)
     if missing:
         raise ValueError(
@@ -248,12 +246,19 @@ def load_workbook(source) -> pd.DataFrame:
     data = df[[DATE_COLUMN, VALUE_COLUMN]].copy()
     data[DATE_COLUMN] = pd.to_datetime(data[DATE_COLUMN], errors="coerce")
     data[VALUE_COLUMN] = pd.to_numeric(data[VALUE_COLUMN], errors="coerce")
+
     data = data.dropna(subset=[DATE_COLUMN, VALUE_COLUMN])
     data[VALUE_COLUMN] = data[VALUE_COLUMN].clip(lower=0)
+
     return data.sort_values(DATE_COLUMN).reset_index(drop=True)
 
 
-def aggregate_series(df: pd.DataFrame, start_date, end_date, frequency: str) -> tuple[pd.DataFrame, pd.Series]:
+def aggregate_series(
+    df: pd.DataFrame,
+    start_date,
+    end_date,
+    frequency: str,
+) -> tuple[pd.DataFrame, pd.Series]:
     mask = df[DATE_COLUMN].between(pd.Timestamp(start_date), pd.Timestamp(end_date))
     filtered = df.loc[mask].copy()
 
@@ -271,29 +276,40 @@ def aggregate_series(df: pd.DataFrame, start_date, end_date, frequency: str) -> 
     series = daily.resample(frequency).sum().astype(float)
     series = series.ffill()
     series.name = "Permintaan"
+
     return filtered, series
 
 
-def evaluate_model(y_true: pd.Series, y_pred: pd.Series) -> tuple[float, float, float]:
-    pred = pd.Series(y_pred, index=y_true.index).astype(float)
+# =========================
+# MODEL ARIMA
+# =========================
+
+def evaluate_forecast(y_true: pd.Series, y_pred: pd.Series) -> tuple[float, float, float]:
     actual = y_true.astype(float)
-    mae = mean_absolute_error(actual, pred)
-    rmse = float(np.sqrt(mean_squared_error(actual, pred)))
+    pred = pd.Series(y_pred, index=actual.index).astype(float)
+
+    mae = float(np.mean(np.abs(actual - pred)))
+    rmse = float(np.sqrt(np.mean((actual - pred) ** 2)))
+
     denominator = actual.replace(0, np.nan)
     mape = float((np.abs((actual - pred) / denominator).dropna().mean() * 100))
+
     if np.isnan(mape):
         mape = 0.0
-    return float(mae), rmse, mape
+
+    return mae, rmse, mape
 
 
 @st.cache_data(show_spinner=False)
-def run_forecast_models(
+def run_arima_model(
     series: pd.Series,
-    moving_average_window: int,
     forecast_steps: int,
-) -> tuple[pd.Series, pd.Series, list[ModelResult], pd.Series, str]:
-    if len(series) < 8:
-        raise ValueError("Data terlalu sedikit untuk train/test forecasting. Gunakan rentang tanggal yang lebih panjang.")
+) -> tuple[pd.Series, pd.Series, pd.Series, pd.Series, float, float, float, str]:
+    if len(series) < 10:
+        raise ValueError(
+            "Data terlalu sedikit untuk menjalankan ARIMA. "
+            "Gunakan rentang tanggal yang lebih panjang."
+        )
 
     train_size = max(1, int(len(series) * 0.8))
     train = series.iloc[:train_size]
@@ -302,55 +318,57 @@ def run_forecast_models(
     if test.empty:
         raise ValueError("Data test kosong. Tambahkan rentang tanggal atau kurangi filter.")
 
-    history = train.astype(float).tolist()
-    naive_values = []
-    for value in test:
-        naive_values.append(history[-1])
-        history.append(float(value))
-    naive_pred = pd.Series(naive_values, index=test.index, name="Naive")
-    naive_metrics = evaluate_model(test, naive_pred)
-
-    history = train.astype(float).tolist()
-    ma_values = []
-    window = max(1, min(moving_average_window, len(history)))
-    for value in test:
-        ma_values.append(float(np.mean(history[-window:])))
-        history.append(float(value))
-    ma_pred = pd.Series(ma_values, index=test.index, name="Moving Average")
-    ma_metrics = evaluate_model(test, ma_pred)
-
-    results = [
-        ModelResult("Naive", naive_pred, *naive_metrics),
-        ModelResult("Moving Average", ma_pred, *ma_metrics),
-    ]
-
-    arima_note = ""
-    try:
-        arima_fit = ARIMA(train, order=(1, 1, 1)).fit()
-        arima_pred = arima_fit.forecast(steps=len(test))
-        arima_pred = pd.Series(arima_pred.to_numpy(), index=test.index, name="ARIMA")
-        arima_metrics = evaluate_model(test, arima_pred)
-        results.append(ModelResult("ARIMA", arima_pred, *arima_metrics))
-    except Exception as exc:  # pragma: no cover - surfaced in UI
-        arima_note = f"ARIMA tidak dapat dihitung untuk rentang ini: {exc}"
+    note = ""
 
     try:
-        final_fit = ARIMA(series, order=(1, 1, 1)).fit()
-        future = final_fit.forecast(steps=forecast_steps)
-        future = pd.Series(future.to_numpy(), index=future.index, name="Forecast")
-        future = future.clip(lower=0)
-    except Exception:
-        last_value = float(series.iloc[-1])
-        future_index = pd.date_range(
-            start=series.index[-1] + pd.tseries.frequencies.to_offset(series.index.freqstr or "W"),
-            periods=forecast_steps,
-            freq=series.index.freqstr or "W",
+        test_fit = ARIMA(train, order=ARIMA_ORDER).fit()
+        test_forecast = test_fit.forecast(steps=len(test))
+        test_forecast = pd.Series(
+            test_forecast.to_numpy(),
+            index=test.index,
+            name="Prediksi ARIMA"
         )
-        future = pd.Series([last_value] * forecast_steps, index=future_index, name="Forecast")
-        arima_note = "Forecast masa depan memakai fallback nilai terakhir karena ARIMA gagal pada rentang ini."
+        test_forecast = test_forecast.clip(lower=0)
 
-    return train, test, results, future, arima_note
+        mae, rmse, mape = evaluate_forecast(test, test_forecast)
 
+    except Exception as exc:
+        raise ValueError(f"Model {MODEL_NAME} gagal menghitung data testing: {exc}")
+
+    try:
+        final_fit = ARIMA(series, order=ARIMA_ORDER).fit()
+        future = final_fit.forecast(steps=forecast_steps)
+        future = pd.Series(
+            future.to_numpy(),
+            index=future.index,
+            name="Forecast ARIMA"
+        )
+        future = future.clip(lower=0)
+
+    except Exception as exc:
+        last_value = float(series.iloc[-1])
+        freq = series.index.freqstr or "W"
+        future_index = pd.date_range(
+            start=series.index[-1] + pd.tseries.frequencies.to_offset(freq),
+            periods=forecast_steps,
+            freq=freq,
+        )
+        future = pd.Series(
+            [last_value] * forecast_steps,
+            index=future_index,
+            name="Forecast ARIMA"
+        )
+        note = (
+            f"Forecast masa depan memakai nilai terakhir karena model {MODEL_NAME} "
+            f"gagal menghitung forecast lanjutan: {exc}"
+        )
+
+    return train, test, test_forecast, future, mae, rmse, mape, note
+
+
+# =========================
+# FORMAT DAN KOMPONEN UI
+# =========================
 
 def format_number(value: float, decimals: int = 0) -> str:
     if pd.isna(value):
@@ -368,21 +386,31 @@ def kpi_card(label: str, value: str, help_text: str) -> str:
     )
 
 
-def render_kpis(df: pd.DataFrame, series: pd.Series, best_model: str) -> None:
+def render_kpis(
+    df: pd.DataFrame,
+    series: pd.Series,
+    mae: float,
+    rmse: float,
+    mape: float,
+) -> None:
     total = df[VALUE_COLUMN].sum()
     avg = series.mean()
-    peak_date = series.idxmax().strftime("%d %b %Y")
-    peak_value = series.max()
     latest_date = series.index[-1].strftime("%d %b %Y")
     latest_value = series.iloc[-1]
 
     cards = [
         kpi_card("Total cylinder", format_number(total), f"{len(df):,} transaksi".replace(",", ".")),
         kpi_card("Rata-rata per periode", format_number(avg, 1), "berdasarkan filter aktif"),
-        kpi_card("Puncak permintaan", format_number(peak_value), peak_date),
-        kpi_card("Model terbaik", best_model, f"periode terakhir {latest_date}: {format_number(latest_value)}"),
+        kpi_card("Model yang digunakan", MODEL_NAME, "model utama penelitian"),
+        kpi_card("MAPE", f"{format_number(mape, 2)}%", f"RMSE: {format_number(rmse, 2)} | MAE: {format_number(mae, 2)}"),
     ]
+
     st.markdown(f"<div class='kpi-grid'>{''.join(cards)}</div>", unsafe_allow_html=True)
+
+    st.caption(
+        f"Periode terakhir pada data aktual adalah {latest_date} "
+        f"dengan jumlah permintaan {format_number(latest_value)} cylinder."
+    )
 
 
 def analysis_card(label: str, value: str, help_text: str, highlight: bool = False) -> str:
@@ -396,53 +424,103 @@ def analysis_card(label: str, value: str, help_text: str, highlight: bool = Fals
     )
 
 
-def four_week_analysis(future: pd.Series) -> tuple[pd.DataFrame, str]:
-    horizon = future.head(4).copy()
-    horizon.name = "Forecast Cylinder"
-    peak_date = horizon.idxmax()
-    peak_value = float(horizon.max())
-    total = float(horizon.sum())
-    average = float(horizon.mean())
-    delta = float(horizon.iloc[-1] - horizon.iloc[0])
-    direction = "naik" if delta > 0 else "turun" if delta < 0 else "stabil"
-
-    cards = [
-        analysis_card("Total forecast 4 minggu", format_number(total), "akumulasi kebutuhan forecast"),
-        analysis_card("Rata-rata per minggu", format_number(average, 1), "rata-rata dari 4 minggu forecast"),
-        analysis_card(
-            "Peak demand 4 minggu",
-            format_number(peak_value),
-            peak_date.strftime("%d %b %Y"),
-            highlight=True,
-        ),
-    ]
-
-    table = horizon.reset_index()
-    table.columns = ["Periode", "Forecast Cylinder"]
-    table.insert(0, "Minggu", [f"Minggu {idx}" for idx in range(1, len(table) + 1)])
-    table["Status"] = np.where(table["Periode"] == peak_date, "Peak demand", "Normal")
-
-    insight = (
-        f"Peak demand dari 4 minggu forecast ada pada {peak_date.strftime('%d %b %Y')} "
-        f"dengan estimasi {format_number(peak_value)} cylinder. Tren 4 minggu terlihat {direction} "
-        f"sebesar {format_number(abs(delta), 1)} cylinder dari minggu pertama ke minggu keempat."
+def base_chart_layout(fig: go.Figure, height: int = 420) -> go.Figure:
+    fig.update_layout(
+        height=height,
+        margin=dict(l=12, r=12, t=50, b=20),
+        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="rgba(0,0,0,0)",
+        font=dict(color=TEXT, family="Inter, Roboto, Arial, sans-serif"),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        hovermode="x unified",
     )
-    return table, f"<div class='analysis-grid'>{''.join(cards)}</div><p>{insight}</p>"
+    fig.update_xaxes(showgrid=False, linecolor="#d8dee9")
+    fig.update_yaxes(gridcolor="#e8edf5", zerolinecolor="#e8edf5")
+    return fig
+
+
+# =========================
+# GRAFIK
+# =========================
+
+def actual_forecast_chart(series: pd.Series, future: pd.Series) -> go.Figure:
+    fig = go.Figure()
+
+    fig.add_trace(
+        go.Scatter(
+            x=series.index,
+            y=series.values,
+            mode="lines+markers",
+            name="Data Aktual",
+            line=dict(color=PRIMARY, width=3),
+            marker=dict(size=6),
+        )
+    )
+
+    fig.add_trace(
+        go.Scatter(
+            x=future.index,
+            y=future.values,
+            mode="lines+markers",
+            name=f"Forecast {MODEL_NAME}",
+            line=dict(color=SECONDARY, width=3, dash="dash"),
+            marker=dict(size=7),
+        )
+    )
+
+    fig.update_layout(title=f"Trend Permintaan Aktual dan Forecast {MODEL_NAME}")
+    fig.update_yaxes(title="Jumlah Cylinder")
+
+    return base_chart_layout(fig, 460)
+
+
+def actual_vs_arima_chart(test: pd.Series, test_forecast: pd.Series) -> go.Figure:
+    fig = go.Figure()
+
+    fig.add_trace(
+        go.Scatter(
+            x=test.index,
+            y=test.values,
+            mode="lines+markers",
+            name="Aktual",
+            line=dict(color=TEXT, width=3),
+            marker=dict(size=6),
+        )
+    )
+
+    fig.add_trace(
+        go.Scatter(
+            x=test_forecast.index,
+            y=test_forecast.values,
+            mode="lines+markers",
+            name=f"Prediksi {MODEL_NAME}",
+            line=dict(color=PRIMARY, width=3, dash="dash"),
+            marker=dict(size=7),
+        )
+    )
+
+    fig.update_layout(title=f"Perbandingan Aktual dan Prediksi {MODEL_NAME} pada Data Testing")
+    fig.update_yaxes(title="Jumlah Cylinder")
+
+    return base_chart_layout(fig, 430)
 
 
 def four_week_peak_chart(future: pd.Series) -> go.Figure:
     horizon = future.head(4).copy()
     x_positions = list(range(1, len(horizon) + 1))
     labels = [f"W{idx}<br>{date.strftime('%d %b')}" for idx, date in enumerate(horizon.index, start=1)]
+
     peak_position = int(np.argmax(horizon.values)) + 1
     peak_value = float(horizon.max())
 
     y_min = max(0, float(horizon.min()) * 0.88)
     y_max = float(horizon.max()) * 1.18
+
     if y_max == y_min:
         y_max = y_min + 1
 
     fig = go.Figure()
+
     fig.add_vrect(
         x0=peak_position - 0.5,
         x1=peak_position + 0.5,
@@ -451,16 +529,18 @@ def four_week_peak_chart(future: pd.Series) -> go.Figure:
         line_width=0,
         layer="below",
     )
+
     fig.add_trace(
         go.Scatter(
             x=x_positions,
             y=horizon.values,
             mode="lines+markers",
-            name="ARIMA Forecast",
+            name=f"Forecast {MODEL_NAME}",
             line=dict(color="#c92535", width=4, shape="spline"),
             marker=dict(size=9, color="#c92535", line=dict(color="#ffffff", width=2)),
         )
     )
+
     fig.add_trace(
         go.Scatter(
             x=[peak_position],
@@ -472,6 +552,7 @@ def four_week_peak_chart(future: pd.Series) -> go.Figure:
             hovertemplate="Peak Demand<br>%{y:,.0f} cylinder<extra></extra>",
         )
     )
+
     fig.add_annotation(
         x=peak_position,
         y=y_max * 0.965,
@@ -482,9 +563,10 @@ def four_week_peak_chart(future: pd.Series) -> go.Figure:
         bgcolor="rgba(255, 241, 168, 0.72)",
         borderpad=6,
     )
+
     fig.update_layout(
         title=dict(
-            text="<b>Request Order Cylinder<br>Forecast</b><br><sup>Weekly Demand Projection</sup>",
+            text="<b>Forecast Permintaan Cylinder 4 Periode ke Depan</b><br><sup>ARIMA(3,0,3)</sup>",
             x=0,
             xanchor="left",
             font=dict(size=21, color=TEXT),
@@ -497,6 +579,7 @@ def four_week_peak_chart(future: pd.Series) -> go.Figure:
         legend=dict(orientation="h", yanchor="top", y=-0.18, xanchor="center", x=0.5),
         hovermode="x unified",
     )
+
     fig.update_xaxes(
         tickmode="array",
         tickvals=x_positions,
@@ -506,93 +589,95 @@ def four_week_peak_chart(future: pd.Series) -> go.Figure:
         linecolor="#d8dee9",
         title=None,
     )
+
     fig.update_yaxes(
         title="Jumlah Cylinder",
         range=[y_min, y_max],
         gridcolor="#e8edf5",
         zerolinecolor="#e8edf5",
     )
+
     return fig
 
 
-def base_chart_layout(fig: go.Figure, height: int = 420) -> go.Figure:
-    fig.update_layout(
-        height=height,
-        margin=dict(l=12, r=12, t=42, b=16),
-        plot_bgcolor="rgba(0,0,0,0)",
-        paper_bgcolor="rgba(0,0,0,0)",
-        font=dict(color=TEXT, family="Inter, Roboto, Arial, sans-serif"),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        hovermode="x unified",
-    )
-    fig.update_xaxes(showgrid=False, linecolor="#d8dee9")
-    fig.update_yaxes(gridcolor="#e8edf5", zerolinecolor="#e8edf5")
-    return fig
+# =========================
+# TABEL DAN ANALISIS
+# =========================
 
-
-def trend_chart(series: pd.Series, future: pd.Series) -> go.Figure:
-    fig = go.Figure()
-    fig.add_trace(
-        go.Scatter(
-            x=series.index,
-            y=series.values,
-            mode="lines+markers",
-            name="Actual",
-            line=dict(color=PRIMARY, width=3),
-            marker=dict(size=6),
-        )
-    )
-    fig.add_trace(
-        go.Scatter(
-            x=future.index,
-            y=future.values,
-            mode="lines+markers",
-            name="Forecast",
-            line=dict(color=SECONDARY, width=3, dash="dash"),
-            marker=dict(size=7),
-        )
-    )
-    fig.update_layout(title="Trend Permintaan dan Forecast ke Depan")
-    return base_chart_layout(fig, 460)
-
-
-def comparison_chart(test: pd.Series, results: list[ModelResult]) -> go.Figure:
-    fig = go.Figure()
-    fig.add_trace(
-        go.Scatter(
-            x=test.index,
-            y=test.values,
-            mode="lines+markers",
-            name="Actual",
-            line=dict(color=TEXT, width=3),
-        )
-    )
-    colors = {"Naive": AMBER, "Moving Average": CORAL, "ARIMA": PRIMARY}
-    for result in results:
-        fig.add_trace(
-            go.Scatter(
-                x=result.predictions.index,
-                y=result.predictions.values,
-                mode="lines+markers",
-                name=result.name,
-                line=dict(color=colors.get(result.name, SECONDARY), width=2, dash="dash"),
-            )
-        )
-    fig.update_layout(title="Perbandingan Model pada Data Test")
-    return base_chart_layout(fig, 420)
-
-
-def metrics_table(results: list[ModelResult]) -> pd.DataFrame:
-    table = pd.DataFrame(
+def evaluation_table(mae: float, rmse: float, mape: float) -> pd.DataFrame:
+    return pd.DataFrame(
         {
-            "Model": [result.name for result in results],
-            "MAE": [result.mae for result in results],
-            "RMSE": [result.rmse for result in results],
-            "MAPE (%)": [result.mape for result in results],
+            "Model": [MODEL_NAME],
+            "MAE": [mae],
+            "RMSE": [rmse],
+            "MAPE (%)": [mape],
         }
     )
-    return table.sort_values("RMSE", ascending=True).reset_index(drop=True)
 
+
+def forecast_table(future: pd.Series) -> pd.DataFrame:
+    table = future.reset_index()
+    table.columns = ["Periode", "Forecast Cylinder"]
+    table["Forecast Cylinder"] = table["Forecast Cylinder"].round(0)
+    return table
+
+
+def actual_prediction_table(test: pd.Series, test_forecast: pd.Series) -> pd.DataFrame:
+    table = pd.DataFrame(
+        {
+            "Periode": test.index,
+            "Aktual": test.values,
+            "Prediksi ARIMA": test_forecast.values,
+        }
+    )
+
+    table["Selisih"] = table["Aktual"] - table["Prediksi ARIMA"]
+    table["Absolute Error"] = table["Selisih"].abs()
+
+    return table
+
+
+def four_week_analysis(future: pd.Series) -> tuple[pd.DataFrame, str]:
+    horizon = future.head(4).copy()
+    peak_date = horizon.idxmax()
+    peak_value = float(horizon.max())
+    total = float(horizon.sum())
+    average = float(horizon.mean())
+    delta = float(horizon.iloc[-1] - horizon.iloc[0])
+
+    direction = "naik" if delta > 0 else "turun" if delta < 0 else "stabil"
+
+    cards = [
+        analysis_card("Total forecast 4 periode", format_number(total), "akumulasi kebutuhan forecast"),
+        analysis_card("Rata-rata per periode", format_number(average, 1), "rata-rata dari 4 periode forecast"),
+        analysis_card(
+            "Peak demand forecast",
+            format_number(peak_value),
+            peak_date.strftime("%d %b %Y"),
+            highlight=True,
+        ),
+    ]
+
+    table = horizon.reset_index()
+    table.columns = ["Periode", "Forecast Cylinder"]
+    table.insert(0, "Periode Forecast", [f"Periode {idx}" for idx in range(1, len(table) + 1)])
+    table["Status"] = np.where(table["Periode"] == peak_date, "Peak demand", "Normal")
+
+    insight = (
+        f"Berdasarkan hasil forecast {MODEL_NAME}, peak demand dari 4 periode ke depan "
+        f"diperkirakan terjadi pada {peak_date.strftime('%d %b %Y')} dengan estimasi "
+        f"{format_number(peak_value)} cylinder. Tren forecast terlihat {direction} sebesar "
+        f"{format_number(abs(delta), 1)} cylinder dari periode pertama ke periode keempat."
+    )
+
+    summary_html = f"<div class='analysis-grid'>{''.join(cards)}</div><p>{insight}</p>"
+
+    return table, summary_html
+
+
+# =========================
+# MAIN APP
+# =========================
 
 def main() -> None:
     inject_css()
@@ -601,7 +686,7 @@ def main() -> None:
         """
         <div class="hero">
             <h1>Dashboard Forecast Permintaan Cylinder</h1>
-            <p>Monitoring tren permintaan, evaluasi model forecasting, dan proyeksi kebutuhan beberapa periode ke depan.</p>
+            <p>Visualisasi hasil peramalan permintaan menggunakan model ARIMA(3,0,3).</p>
         </div>
         """,
         unsafe_allow_html=True,
@@ -609,7 +694,13 @@ def main() -> None:
 
     with st.sidebar:
         st.subheader("Kontrol Dashboard")
-        uploaded_file = st.file_uploader("Gunakan file Excel lain", type=["xlsx", "xls"])
+
+        uploaded_file = st.file_uploader(
+            "Gunakan file Excel lain",
+            type=["xlsx", "xls"],
+            help="File harus memiliki kolom Tanggal Job dan Jumlah Cylinder."
+        )
+
         source = uploaded_file if uploaded_file is not None else DATA_FILE
 
         try:
@@ -620,12 +711,14 @@ def main() -> None:
 
         min_date = df[DATE_COLUMN].min().date()
         max_date = df[DATE_COLUMN].max().date()
+
         selected_dates = st.date_input(
             "Rentang tanggal",
             value=(min_date, max_date),
             min_value=min_date,
             max_value=max_date,
         )
+
         if not isinstance(selected_dates, tuple) or len(selected_dates) != 2:
             st.info("Pilih tanggal mulai dan tanggal akhir.")
             st.stop()
@@ -635,71 +728,114 @@ def main() -> None:
             options=["Mingguan", "Bulanan"],
             default="Mingguan",
         )
+
         frequency = "W" if frequency_label == "Mingguan" else "MS"
 
-        forecast_steps = st.slider("Jumlah periode forecast", 4, 12, 4)
-        ma_window = st.slider("Window Moving Average", 2, 8, 3)
+        forecast_steps = st.slider(
+            "Jumlah periode forecast",
+            min_value=4,
+            max_value=12,
+            value=4,
+        )
 
-    filtered_df, series = aggregate_series(df, selected_dates[0], selected_dates[1], frequency)
+    filtered_df, series = aggregate_series(
+        df,
+        selected_dates[0],
+        selected_dates[1],
+        frequency,
+    )
+
     if filtered_df.empty or series.empty:
         st.warning("Tidak ada data pada rentang tanggal yang dipilih.")
         st.stop()
 
-    with st.spinner("Menghitung model forecasting..."):
+    with st.spinner(f"Menghitung model {MODEL_NAME}..."):
         try:
-            train, test, results, future, arima_note = run_forecast_models(series, ma_window, forecast_steps)
+            train, test, test_forecast, future, mae, rmse, mape, arima_note = run_arima_model(
+                series,
+                forecast_steps,
+            )
         except Exception as exc:
             st.error(str(exc))
             st.stop()
 
-    ranking = metrics_table(results)
-    best_model = ranking.iloc[0]["Model"]
-    render_kpis(filtered_df, series, best_model)
+    render_kpis(filtered_df, series, mae, rmse, mape)
 
     if arima_note:
         st.info(arima_note)
 
     left, right = st.columns([1.45, 1], gap="large")
+
     with left:
-        st.markdown("<div class='section-title'>Forecast</div>", unsafe_allow_html=True)
-        st.plotly_chart(trend_chart(series, future), width="stretch")
+        st.markdown("<div class='section-title'>Forecast Permintaan</div>", unsafe_allow_html=True)
+        st.plotly_chart(actual_forecast_chart(series, future), width="stretch")
+
     with right:
-        st.markdown("<div class='section-title'>Evaluasi Model</div>", unsafe_allow_html=True)
-        st.dataframe(
-            ranking.style.format({"MAE": "{:,.2f}", "RMSE": "{:,.2f}", "MAPE (%)": "{:,.2f}"}),
-            width="stretch",
-            hide_index=True,
-        )
-        st.caption("Model terbaik dipilih dari RMSE terkecil pada data test 20%.")
+        st.markdown("<div class='section-title'>Evaluasi Model ARIMA</div>", unsafe_allow_html=True)
 
-        future_table = future.reset_index()
-        future_table.columns = ["Periode", "Forecast Cylinder"]
+        eval_df = evaluation_table(mae, rmse, mape)
         st.dataframe(
-            future_table.style.format({"Forecast Cylinder": "{:,.0f}"}),
+            eval_df.style.format({
+                "MAE": "{:,.2f}",
+                "RMSE": "{:,.2f}",
+                "MAPE (%)": "{:,.2f}",
+            }),
             width="stretch",
             hide_index=True,
         )
 
-    st.markdown("<div class='section-title'>Analisa 4 Minggu ke Depan</div>", unsafe_allow_html=True)
+        st.caption(
+            "Evaluasi dilakukan dengan membandingkan data aktual dan prediksi ARIMA "
+            "pada data testing sebesar 20% dari total data."
+        )
+
+        st.markdown("<div class='section-title'>Tabel Forecast</div>", unsafe_allow_html=True)
+
+        future_df = forecast_table(future)
+        st.dataframe(
+            future_df.style.format({"Forecast Cylinder": "{:,.0f}"}),
+            width="stretch",
+            hide_index=True,
+        )
+
+    st.markdown("<div class='section-title'>Analisa Forecast 4 Periode ke Depan</div>", unsafe_allow_html=True)
+
     four_week_table, four_week_summary = four_week_analysis(future)
     st.markdown(four_week_summary, unsafe_allow_html=True)
+
     st.plotly_chart(four_week_peak_chart(future), width="stretch")
+
     st.dataframe(
         four_week_table.style.format({"Forecast Cylinder": "{:,.0f}"}),
         width="stretch",
         hide_index=True,
     )
 
-    st.markdown("<div class='section-title'>Perbandingan Aktual vs Prediksi</div>", unsafe_allow_html=True)
-    st.plotly_chart(comparison_chart(test, results), width="stretch")
+    st.markdown("<div class='section-title'>Aktual vs Prediksi ARIMA pada Data Testing</div>", unsafe_allow_html=True)
+
+    st.plotly_chart(actual_vs_arima_chart(test, test_forecast), width="stretch")
+
+    prediction_df = actual_prediction_table(test, test_forecast)
+    st.dataframe(
+        prediction_df.style.format({
+            "Aktual": "{:,.0f}",
+            "Prediksi ARIMA": "{:,.0f}",
+            "Selisih": "{:,.2f}",
+            "Absolute Error": "{:,.2f}",
+        }),
+        width="stretch",
+        hide_index=True,
+    )
 
     with st.expander("Lihat data olahan"):
         tab_daily, tab_periodic, tab_raw = st.tabs(["Harian", "Agregasi", "Transaksi"])
+
         daily_table = (
             filtered_df.groupby(DATE_COLUMN, as_index=False)[VALUE_COLUMN]
             .sum()
             .sort_values(DATE_COLUMN)
         )
+
         periodic_table = series.reset_index()
         periodic_table.columns = ["Periode", "Jumlah Cylinder"]
 
