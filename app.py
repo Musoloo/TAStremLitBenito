@@ -474,37 +474,6 @@ def actual_forecast_chart(series: pd.Series, future: pd.Series) -> go.Figure:
     return base_chart_layout(fig, 460)
 
 
-def actual_vs_arima_chart(test: pd.Series, test_forecast: pd.Series) -> go.Figure:
-    fig = go.Figure()
-
-    fig.add_trace(
-        go.Scatter(
-            x=test.index,
-            y=test.values,
-            mode="lines+markers",
-            name="Aktual",
-            line=dict(color=TEXT, width=3),
-            marker=dict(size=6),
-        )
-    )
-
-    fig.add_trace(
-        go.Scatter(
-            x=test_forecast.index,
-            y=test_forecast.values,
-            mode="lines+markers",
-            name=f"Prediksi {MODEL_NAME}",
-            line=dict(color=PRIMARY, width=3, dash="dash"),
-            marker=dict(size=7),
-        )
-    )
-
-    fig.update_layout(title=f"Perbandingan Aktual dan Prediksi {MODEL_NAME} pada Data Testing")
-    fig.update_yaxes(title="Jumlah Cylinder")
-
-    return base_chart_layout(fig, 430)
-
-
 def four_week_peak_chart(future: pd.Series) -> go.Figure:
     horizon = future.head(4).copy()
     x_positions = list(range(1, len(horizon) + 1))
@@ -619,21 +588,6 @@ def forecast_table(future: pd.Series) -> pd.DataFrame:
     table = future.reset_index()
     table.columns = ["Periode", "Forecast Cylinder"]
     table["Forecast Cylinder"] = table["Forecast Cylinder"].round(0)
-    return table
-
-
-def actual_prediction_table(test: pd.Series, test_forecast: pd.Series) -> pd.DataFrame:
-    table = pd.DataFrame(
-        {
-            "Periode": test.index,
-            "Aktual": test.values,
-            "Prediksi ARIMA": test_forecast.values,
-        }
-    )
-
-    table["Selisih"] = table["Aktual"] - table["Prediksi ARIMA"]
-    table["Absolute Error"] = table["Selisih"].abs()
-
     return table
 
 
@@ -807,22 +761,6 @@ def main() -> None:
 
     st.dataframe(
         four_week_table.style.format({"Forecast Cylinder": "{:,.0f}"}),
-        width="stretch",
-        hide_index=True,
-    )
-
-    st.markdown("<div class='section-title'>Aktual vs Prediksi ARIMA pada Data Testing</div>", unsafe_allow_html=True)
-
-    st.plotly_chart(actual_vs_arima_chart(test, test_forecast), width="stretch")
-
-    prediction_df = actual_prediction_table(test, test_forecast)
-    st.dataframe(
-        prediction_df.style.format({
-            "Aktual": "{:,.0f}",
-            "Prediksi ARIMA": "{:,.0f}",
-            "Selisih": "{:,.2f}",
-            "Absolute Error": "{:,.2f}",
-        }),
         width="stretch",
         hide_index=True,
     )
